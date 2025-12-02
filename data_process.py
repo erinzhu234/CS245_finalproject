@@ -1,292 +1,150 @@
-from websocietysimulator import Simulator
-from websocietysimulator.agent import SimulationAgent
-from websocietysimulator.llm import LLMBase, InfinigenceLLM
-from websocietysimulator.agent.modules.planning_modules import PlanningBase
-from websocietysimulator.agent.modules.reasoning_modules import ReasoningBase
-from websocietysimulator.agent.modules.memory_modules import MemoryDILU
-from datetime import datetime
-from typing import Optional, Dict, List, Any, Union, Tuple
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import os
-import random
-import re
+"""
+Lightweight dataset processor to produce the JSONL files expected by WebSocietySimulator.
+
+Usage (Yelp):
+    python data_process.py --input /path/to/raw_yelp --output /path/to/processed_yelp
+
+Input directory must contain:
+    - yelp_academic_dataset_business.json
+    - yelp_academic_dataset_user.json
+    - yelp_academic_dataset_review.json
+
+Output directory will contain:
+    - item.json     (businesses)
+    - user.json
+    - review.json   (reviews)
+"""
+from __future__ import annotations
+
+import argparse
+import gzip
 import json
-import logging
+import os
+from pathlib import Path
+from typing import Iterable, Iterator, TextIO
 
-logging.basicConfig(level=logging.INFO)
+
+def _open_text(path: Path) -> TextIO:
+    """Open a JSON or JSON.GZ file for reading text."""
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", encoding="utf-8")
+    return path.open("r", encoding="utf-8")
 
 
-class PlanningBaseline(PlanningBase):
-    """Inherit from PlanningBase"""
+def _iter_json_lines(path: Path) -> Iterator[dict]:
+    with _open_text(path) as f:
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
 
-    def __init__(self, llm):
-        """Initialize the planning module"""
-        super().__init__(llm=llm)
 
-    def __call__(self, task_description):
-        """Override the parent class's __call__ method"""
-        self.plan = [
-            {
-                'description': 'First I need to find user information',
-                'reasoning instruction': 'None',
-                'tool use instruction': {task_description['user_id']}
-            },
-            {
-                'description': 'Next, I need to find business information',
-                'reasoning instruction': 'None',
-                'tool use instruction': {task_description['item_id']}
+def _write_jsonl(path: Path, records: Iterable[dict]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def process_yelp(input_dir: Path, output_dir: Path) -> None:
+    """Convert Yelp academic JSON to simulator-friendly JSONL files."""
+    biz_raw = input_dir / "yelp_academic_dataset_business.json"
+    user_raw = input_dir / "yelp_academic_dataset_user.json"
+    review_raw = input_dir / "yelp_academic_dataset_review.json"
+
+    for p in [biz_raw, user_raw, review_raw]:
+        if not p.exists():
+            raise FileNotFoundError(f"Missing required file: {p}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    item_out = output_dir / "item.json"
+    user_out = output_dir / "user.json"
+    review_out = output_dir / "review.json"
+
+    print(f"[yelp] writing {item_out} ...")
+    def _iter_items() -> Iterator[dict]:
+        for biz in _iter_json_lines(biz_raw):
+            categories = biz.get("categories")
+            if isinstance(categories, str):
+                categories = [c.strip() for c in categories.split(",") if c.strip()]
+            elif not isinstance(categories, list):
+                categories = []
+            yield {
+                "item_id": biz.get("business_id"),
+                "name": biz.get("name"),
+                "address": biz.get("address"),
+                "city": biz.get("city"),
+                "state": biz.get("state"),
+                "postal_code": biz.get("postal_code"),
+                "stars": biz.get("stars"),
+                "review_count": biz.get("review_count"),
+                "categories": categories,
+                "attributes": biz.get("attributes"),
+                "source": "yelp",
             }
-        ]
-        return self.plan
+    _write_jsonl(item_out, _iter_items())
 
-
-class ReasoningBaseline(ReasoningBase):
-    """Inherit from ReasoningBase"""
-
-    def __init__(self, profile_type_prompt, llm):
-        """Initialize the reasoning module"""
-        super().__init__(profile_type_prompt=profile_type_prompt, memory=None, llm=llm)
-
-    def __call__(self, task_description: str):
-        """Override the parent class's __call__ method"""
-        prompt = '''
-{task_description}'''
-        prompt = prompt.format(task_description=task_description)
-
-        messages = [{"role": "user", "content": prompt}]
-        reasoning_result = self.llm(
-            messages=messages,
-            temperature=0.0,
-            max_tokens=1000
-        )
-
-        return reasoning_result
-
-
-class MySimulationAgent(SimulationAgent):
-    """Participant's implementation of SimulationAgent."""
-
-    def __init__(self, llm: LLMBase):
-        """Initialize MySimulationAgent"""
-        super().__init__(llm=llm)
-        self.planning = PlanningBaseline(llm=self.llm)
-        self.reasoning = ReasoningBaseline(profile_type_prompt='', llm=self.llm)
-        self.memory = MemoryDILU(llm=self.llm)
-
-    def generate_user_description(self, user_info: Dict[str, str], source: str) -> str:
-        """
-        生成用户描述并返回响应。
-
-        :param user_info: 包含用户信息的字典
-        :param source: 数据源（例如 'yelp'）
-        :return: 模型生成的自然语言描述
-        """
-        # 删除 'friends' 键
-        del user_info['friends']
-
-        # 将 user_info 转换为字符串
-        user_info_str = str(user_info)
-
-        # 创建提示词
-        prompt_filled = f"""The following is a user data of the {source} dataset after processing. Please write a paragraph in natural language describing the user. The description should cover their review activity (how many reviews they have written and their impact on the community, such as "useful," "funny," and "cool" votes), their elite status (mention the years they were considered Elite), and any notable aspects of their social circle (such as the number of friends they have). Make sure to convey the user's personality and activity on the platform, without including raw data, and keep it in a conversational tone,Your description should be fair and just,Keep your reply to around 100 words,Please describe in the second person:{user_info_str}"""
-
-        # 调用模型生成响应
-        response = self.reasoning(prompt_filled)
-
-        return response
-
-    def generate_item_description(self, item_info: Dict[str, str], source: str) -> str:
-        """
-        生成用户描述并返回响应。
-
-        :param user_info: 包含用户信息的字典
-        :param source: 数据源（例如 'yelp'）
-        :return: 模型生成的自然语言描述
-        """
-        # 删除 'friends' 键
-
-        # 将 user_info 转换为字符串
-        item_info_str = str(item_info)
-
-        # 创建提示词
-        prompt_filled = f"""The following is a business data of the {source} dataset after processing. 
-Please write a paragraph in natural language describing the business. 
-If there are numbers in it, it is best to describe them.
-The description should cover the name of the business, its location (address, city, and state), the type of business, its rating (stars), and the number of reviews. 
-Mention the attributes such as whether it offers delivery, takeout, reservations, and whether it has a TV or parking. 
-Also include any notable features like the ambiance, noise level, and what type of crowd it attracts (e.g., good for groups, casual, etc.). 
-Make sure to describe the business in a way that reflects its character, customer experience, and atmosphere. 
-Your description should be fair and just, and keep your reply to around 100 words:
-{item_info_str}"""
-
-        # 调用模型生成响应
-        response = self.reasoning(prompt_filled)
-        return response
-
-    def generate_item_review_description(self, item_review_info: Dict[str, str], source: str) -> str:
-        """
-        生成用户描述并返回响应。
-
-        :param user_info: 包含用户信息的字典
-        :param source: 数据源（例如 'yelp'）
-        :return: 模型生成的自然语言描述
-        """
-        # 删除 'friends' 键
-
-        # 将 user_info 转换为字符串
-        item_review_info = str(item_review_info)
-
-        # 创建提示词
-        prompt_filled = f"""The following is a collection of user reviews for the business  from the {source} dataset. 
-        Please write a comprehensive summary of the reviews in natural language. 
-        Your description should:
-        1. Summarize the general sentiment (positive or negative) expressed across the reviews.
-        2. Highlight recurring themes or issues (e.g., poor service, food quality, atmosphere).
-        3. Mention any specific strengths or weaknesses pointed out by multiple reviewers (e.g., friendly staff, slow service, great food).
-        4. If applicable, include the most common ratings or complaints (e.g., average rating, issues with cleanliness or pricing).
-        5. Avoid repeating the same information and keep the summary balanced and fair, reflecting both positive and negative feedback.
-        Please ensure the review summary is clear, concise, and informative, with a word limit of around 300 words:
-        {item_review_info}"""
-        # 调用模型生成响应
-        response = self.reasoning(prompt_filled)
-
-        return response
-
-    def generate_user_review_description(self, user_review_info: Dict[str, str], source: str) -> str:
-        """
-        生成用户描述并返回响应。
-
-        :param user_info: 包含用户信息的字典
-        :param source: 数据源（例如 'yelp'）
-        :return: 模型生成的自然语言描述
-        """
-        # 删除 'friends' 键
-
-        # 将 user_info 转换为字符串
-        user_review_info = str(user_review_info)
-
-        # 创建提示词
-        prompt_filled = f"""The following is a collection of historical reviews written by a user from the {source} dataset. 
-        Please analyze the user's reviewing style and summarize their characteristics. 
-        Focus on the following aspects:
-        1. The user's tone and language (e.g., formal, casual, critical, humorous).
-        2. Common themes or topics the user frequently comments on (e.g., food quality, service, atmosphere).
-        3. The level of detail in the reviews (e.g., whether they provide specific examples or remain general).
-        4. The user's sentiment (e.g., balanced, overly positive, overly negative).
-        5. Any patterns in the user's ratings (e.g., tends to give moderate scores, extremes, or consistent ratings).
-        6. How the user evaluates positives and negatives in the experience.
-        Based on this analysis, provide a concise summary of the user's reviewing style in natural language, highlighting their typical approach to writing reviews. Limit the summary to around 100 words,Please describe in the second person:
-        {user_review_info}"""
-
-        # 调用模型生成响应
-        response = self.reasoning(prompt_filled)
-
-        return response
-
-    def workflow(self):
-        """
-        Simulate user behavior
-        Returns:
-            tuple: (star (float), useful (float), funny (float), cool (float), review_text (str))
-        """
-        try:
-            user_id = self.task.get('user_id')
-            item_id = self.task.get('item_id')
-
-            # 获取相关评论
-            item_reviews = self.interaction_tool.get_reviews(item_id=item_id)
-            user_reviews = self.interaction_tool.get_reviews(user_id=user_id)
-            user_info = self.interaction_tool.get_user(user_id=user_id)
-            item_info = self.interaction_tool.get_item(item_id=item_id)
-            # 随机选择一些评论以供参考
-            # random_item_reviews = random.sample(item_reviews, min(len(item_reviews), 5))
-            # random_user_reviews = random.sample(user_reviews, min(len(user_reviews), 5))
-
-            item_reviews_text = ""
-            user_reviews_text = ""
-
-            # 获取用户来源信息
-            source = user_info.get('source')
-            after_user_info = self.generate_user_description(user_info, source)
-            item_description = self.generate_item_description(item_info, source)
-            item_reviews_text = self.generate_item_review_description(item_reviews, source)
-            user_reviews_text = self.generate_user_review_description(user_reviews, source)
-
-            task_description = f'''
-        You are a real human user on {source} dataset, a platform for crowd-sourced business reviews. Here is some description of your past, including some of your activities on the platform: 
-        {after_user_info},{user_reviews_text}.
-            ###The overall situation of this business: {item_description}###
-            ###Here is a summary of the reviews this product has received in the past: {item_reviews_text}###
-            You need to write a review for this business,
-            Please analyze the following aspects carefully:
-            1. Based on your user profile and review style, what rating would you give this business? Remember that many users give 5-star ratings for excellent experiences that exceed expectations, and 1-star ratings for very poor experiences that fail to meet basic standards.
-            2. Given the business details and your past experiences, what specific aspects would you comment on? Focus on the positive aspects that make this business stand out or negative aspects that severely impact the experience.
-            Requirements:
-            - Star rating must be one of: 1.0, 2.0, 3.0, 4.0, 5.0
-            - If the business meets or exceeds expectations in key areas, consider giving a 5-star rating
-            - If the business fails significantly in key areas, consider giving a 1-star rating
-            - Review text should be 2-4 sentences, focusing on your personal experience and emotional response
-            - Useful/funny/cool counts should be non-negative integers that reflect likely user engagement
-            - Maintain consistency with your historical review style and rating patterns
-            - Focus on specific details about the business rather than generic comments
-            - Be generous with ratings when businesses deliver quality service and products
-            - Be critical when businesses fail to meet basic standards
-
-            Format your response exactly as follows:
-            stars: [your rating]
-            review: [your review]
-        '''
-            result = self.reasoning(task_description)
-            logging.info(after_user_info)
-            logging.info(item_description)
-            logging.info(user_reviews_text)
-            logging.info(item_reviews_text)
-            logging.info(f"User Data: {result}")
-            logging.info(f"task_prompt: {task_description}")
-            try:
-                stars_line = [line for line in result.split('\n') if 'stars:' in line][0]
-                review_line = [line for line in result.split('\n') if 'review:' in line][0]
-            except:
-                print('Error:', result)
-
-            stars = float(stars_line.split(':')[1].strip())
-            review_text = review_line.split(':')[1].strip()
-
-            if len(review_text) > 512:
-                review_text = review_text[:512]
-
-            return {
-                "stars": stars,
-                "review": review_text
+    print(f"[yelp] writing {user_out} ...")
+    def _iter_users() -> Iterator[dict]:
+        for user in _iter_json_lines(user_raw):
+            yield {
+                "user_id": user.get("user_id"),
+                "name": user.get("name"),
+                "review_count": user.get("review_count"),
+                "yelping_since": user.get("yelping_since"),
+                "useful": user.get("useful"),
+                "funny": user.get("funny"),
+                "cool": user.get("cool"),
+                "elite": user.get("elite"),
+                "friends": user.get("friends"),
+                "fans": user.get("fans"),
+                "average_stars": user.get("average_stars"),
+                "compliment_list": {k: v for k, v in user.items() if k.startswith("compliment_")},
+                "source": "yelp",
             }
-        except Exception as e:
-            print(f"Error in workflow: {e}")
-            return {
-                "stars": 3,
-                "review": ""
+    _write_jsonl(user_out, _iter_users())
+
+    print(f"[yelp] writing {review_out} ...")
+    def _iter_reviews() -> Iterator[dict]:
+        for rev in _iter_json_lines(review_raw):
+            yield {
+                "review_id": rev.get("review_id"),
+                "user_id": rev.get("user_id"),
+                "item_id": rev.get("business_id"),
+                "stars": rev.get("stars"),
+                "text": rev.get("text"),
+                "date": rev.get("date"),
+                "useful": rev.get("useful"),
+                "funny": rev.get("funny"),
+                "cool": rev.get("cool"),
+                "source": "yelp",
             }
+    _write_jsonl(review_out, _iter_reviews())
+
+    print(f"Done. Files written to: {output_dir}")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Process raw datasets into WebSocietySimulator format.")
+    parser.add_argument("--input", required=True, help="Directory with raw Yelp files.")
+    parser.add_argument("--output", required=True, help="Directory to write processed JSONL files.")
+    parser.add_argument(
+        "--dataset",
+        default="yelp",
+        choices=["yelp"],
+        help="Dataset to process (currently only Yelp supported).",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    input_dir = Path(args.input).expanduser()
+    output_dir = Path(args.output).expanduser()
+
+    if args.dataset == "yelp":
+        process_yelp(input_dir, output_dir)
+    else:
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
 
 
 if __name__ == "__main__":
-    # Set the data
-    task_set = "yelp"  # "goodreads" or "yelp"
-    simulator = Simulator(data_dir="/home/zhaorh/code/AgentSociety/home/zhaorh/code/AgentSociety/dataout", device="gpu",
-                          cache=True)
-    simulator.set_task_and_groundtruth(task_dir=f"./track1/{task_set}/tasks",
-                                       groundtruth_dir=f"./track1/{task_set}/groundtruth")
-
-    # Set the agent and LLM
-    simulator.set_agent(MySimulationAgent)
-    simulator.set_llm(InfinigenceLLM(api_key="sk-dakgi4qrepc5btp2"))
-
-    # Run the simulation
-    # If you don't set the number of tasks, the simulator will run all tasks.
-    outputs = simulator.run_simulation(number_of_tasks=10, enable_threading=True, max_workers=5)
-
-    # Evaluate the agent
-    evaluation_results = simulator.evaluate()
-    with open(f'./evaluation_results_track1_{task_set}.json', 'w') as f:
-        json.dump(evaluation_results, f, indent=4)
-
-    # Get evaluation history
-    evaluation_history = simulator.get_evaluation_history()
+    main()
