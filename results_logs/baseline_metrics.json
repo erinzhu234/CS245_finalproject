@@ -1,9 +1,9 @@
 {
   "type": "simulation",
   "metrics": {
-    "preference_estimation": 0.8782499999999995,
-    "review_generation": 0.7900267139847983,
-    "overall_quality": 0.8341383569923989
+    "preference_estimation": 0.8774999999999995,
+    "review_generation": 0.7914775050300424,
+    "overall_quality": 0.834488752515021
   },
   "data_info": {
     "evaluated_count": 400,
