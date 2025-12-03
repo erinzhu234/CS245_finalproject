@@ -115,7 +115,7 @@ class BaselineUserAgent(SimulationAgent):
 
         intro = f"As a returning local in {city}," if city else "As a frequent diner,"
         return (
-            f"{intro} I would give {name} {stars} stars. "
+            f"{intro} I would give {name} {stars:.1f} stars. "
             f"The experience felt {tone}; standout notes centered on {aspects}. "
             "Overall the visit aligned with what their profile suggested."
         )
@@ -221,13 +221,13 @@ class ReflectiveUserAgent(BaselineUserAgent):
         self._ensure_priors_loaded()
         count = self._user_prior_count.get(user_id, 0)
         sum_val = self._user_prior_sum.get(user_id, 0.0)
-        return self._shrink_mean(sum_val, count, alpha=5.0)
+        return self._shrink_mean(sum_val, count, alpha=10.0)
 
     def _category_prior(self, category: str) -> float:
         self._ensure_priors_loaded()
         count = self._cat_prior_count.get(category, 0)
         sum_val = self._cat_prior_sum.get(category, 0.0)
-        return self._shrink_mean(sum_val, count, alpha=8.0)
+        return self._shrink_mean(sum_val, count, alpha=15.0)
 
     def _predict_stars(
         self,
@@ -242,15 +242,16 @@ class ReflectiveUserAgent(BaselineUserAgent):
         category = self._get_category(item or {})
         prior_user = self._user_prior(user_id) if user_id else self._global_mean
         prior_cat = self._category_prior(category) if category else self._global_mean
-        blended = 0.6 * base_score + 0.25 * prior_user + 0.15 * prior_cat
+        blended = 0.7 * base_score + 0.2 * prior_user + 0.1 * prior_cat
 
         with self._lock:
             cat_bias = self._category_pref.get(category, 0.0)
             user_bias = self._user_bias.get(user_id, 0.0)
 
-        adjusted = blended + 0.35 * cat_bias + 0.25 * user_bias
-        adjusted += 0.03 * self.random.uniform(-1, 1)
-        return _clamp(adjusted)
+        adjusted = blended + 0.2 * cat_bias + 0.15 * user_bias
+        adjusted += 0.02 * self.random.uniform(-1, 1)
+        # Light quantization keeps outputs realistic without losing too much resolution
+        return _clamp(round(adjusted * 5) / 5.0)
 
     def _reflect(self):
         """Update shared memories from accumulated observations."""
@@ -269,11 +270,15 @@ class ReflectiveUserAgent(BaselineUserAgent):
                 cat_scale = 1.0 / (self._category_count[cat] ** 0.5)
                 user_scale = 1.0 / (self._user_count[user_id] ** 0.5)
 
+                # Mild decay toward zero to avoid runaway drift
+                self._category_pref[cat] *= 0.98
+                self._user_bias[user_id] *= 0.98
+
                 self._category_pref[cat] = _clamp(
-                    self._category_pref.get(cat, 0.0) + 0.15 * cat_scale * delta, low=-2, high=2
+                    self._category_pref.get(cat, 0.0) + 0.08 * cat_scale * delta, low=-1.0, high=1.0
                 )
                 self._user_bias[user_id] = _clamp(
-                    self._user_bias.get(user_id, 0.0) + 0.08 * user_scale * delta, low=-1, high=1
+                    self._user_bias.get(user_id, 0.0) + 0.04 * user_scale * delta, low=-0.6, high=0.6
                 )
                 self._history.append(entry)
             self.local_history.clear()
@@ -314,7 +319,8 @@ class ReflectiveUserAgent(BaselineUserAgent):
         if (self.step_count % self.reflection_interval == 0) or recovered_review:
             self._reflect()
 
-        return {"stars": predicted_stars, "review": review_text}
+        # Keep output stars to one decimal to avoid unrealistic precision in text
+        return {"stars": round(predicted_stars, 1), "review": review_text}
 
     # ---------------- feedback from held-out groundtruth ---------------- #
     def observe_groundtruth(self, task: Dict[str, Any], groundtruth: Dict[str, Any], prediction: Dict[str, Any]) -> None:
