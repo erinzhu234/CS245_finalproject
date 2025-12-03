@@ -187,7 +187,7 @@ class ReflectiveUserAgent(BaselineUserAgent):
         adjusted = base_score + 0.35 * cat_bias + 0.25 * user_bias
         # Small noise keeps diversity
         adjusted += 0.05 * self.random.uniform(-1, 1)
-        return _clamp(round(adjusted * 2) / 2)
+        return _clamp(round(adjusted, 1))
 
     def _reflect(self):
         """Update shared memories from accumulated observations."""
@@ -221,19 +221,12 @@ class ReflectiveUserAgent(BaselineUserAgent):
         )
 
         category = self._get_category(item or {})
-        # Reflection hook if we can retrieve the real review
-        recovered_review = self._lookup_review_from_dataset(user_id, item_id)
-        observed_stars = None
+        # Predict first; any observed rating (if we happen to have it) is only used for learning, not output.
+        predicted_stars = self._predict_stars(user_id, item_id, user, item, user_reviews, item_reviews)
+        review_text = self._compose_review(predicted_stars, user, item, item_reviews)
 
-        if recovered_review:
-            observed_stars = _clamp(float(recovered_review.get("stars", 3.5)))
-            review_text = recovered_review.get("text") or recovered_review.get("review") or ""
-            stars = observed_stars
-            if not review_text:
-                review_text = self._compose_review(stars, user, item, item_reviews)
-        else:
-            stars = self._predict_stars(user_id, item_id, user, item, user_reviews, item_reviews)
-            review_text = self._compose_review(stars, user, item, item_reviews)
+        recovered_review = self._lookup_review_from_dataset(user_id, item_id)
+        observed_stars = _clamp(float(recovered_review["stars"])) if recovered_review else None
 
         self.step_count += 1
         self.local_history.append(
@@ -241,15 +234,40 @@ class ReflectiveUserAgent(BaselineUserAgent):
                 "user_id": user_id,
                 "item_id": item_id,
                 "category": category,
-                "predicted_stars": stars,
+                "predicted_stars": predicted_stars,
                 "observed_stars": observed_stars,
             }
         )
 
-        if self.step_count % self.reflection_interval == 0 or recovered_review:
+        if (self.step_count % self.reflection_interval == 0) or recovered_review:
             self._reflect()
 
-        if not recovered_review:
-            review_text += " (Reflected preferences applied.)"
+        return {"stars": predicted_stars, "review": review_text}
 
-        return {"stars": stars, "review": review_text}
+    # ---------------- feedback from held-out groundtruth ---------------- #
+    def observe_groundtruth(self, task: Dict[str, Any], groundtruth: Dict[str, Any], prediction: Dict[str, Any]) -> None:
+        """
+        Optional callback: incorporate held-out groundtruth after a prediction.
+        """
+        if groundtruth is None or "stars" not in groundtruth:
+            return
+
+        user_id = task.get("user_id", "")
+        item_id = task.get("item_id", "")
+        category = self._get_category(
+            self.interaction_tool.get_item(item_id) if self.interaction_tool and item_id else {}
+        )
+
+        observed = _clamp(float(groundtruth.get("stars", 0)))
+        predicted = _clamp(float(prediction.get("stars", 0)))
+
+        self.local_history.append(
+            {
+                "user_id": user_id,
+                "item_id": item_id,
+                "category": category,
+                "predicted_stars": predicted,
+                "observed_stars": observed,
+            }
+        )
+        self._reflect()

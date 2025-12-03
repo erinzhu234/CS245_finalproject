@@ -72,18 +72,48 @@ def _validate_paths(args: argparse.Namespace) -> None:
 
 
 def run_agent(agent_cls: Type[SimulationAgent], run_name: str, args: argparse.Namespace) -> dict:
-    """Build a Simulator, execute a given agent class, evaluate, and persist logs."""
+    """Build a Simulator, execute a given agent class with groundtruth feedback, evaluate, and persist logs."""
     print(f"\n=== Running {run_name} ===")
     sim = Simulator(data_dir=args.data_dir, device=args.device, cache=args.cache)
     sim.set_task_and_groundtruth(task_dir=args.task_dir, groundtruth_dir=args.groundtruth_dir)
     sim.set_agent(agent_cls)
 
-    agent_outputs = sim.run_simulation(
-        number_of_tasks=None if args.num_tasks is None else args.num_tasks,
-        enable_threading=not args.no_threading,
-        max_workers=args.max_workers,
+    task_limit = None if args.num_tasks is None else args.num_tasks
+    tasks = sim.tasks[:task_limit]
+    groundtruth = sim.groundtruth_data[: len(tasks)]
+
+    agent = agent_cls(llm=None)
+    agent.set_interaction_tool(sim.interaction_tool)
+
+    agent_outputs = []
+    for idx, (task, gt) in enumerate(zip(tasks, groundtruth)):
+        agent.insert_task(task)
+        output = agent.workflow()
+        agent_outputs.append({"task": task.to_dict(), "output": output})
+
+        if hasattr(agent, "observe_groundtruth"):
+            try:
+                agent.observe_groundtruth(task=task.to_dict(), groundtruth=gt, prediction=output)
+            except TypeError:
+                # Fallback for older signatures
+                agent.observe_groundtruth(task.to_dict(), gt, output)
+
+        if (idx + 1) % 100 == 0:
+            print(f"{run_name}: completed {idx + 1} / {len(tasks)} tasks")
+
+    metrics_obj = sim.simulation_evaluator.calculate_metrics(
+        simulated_data=[entry["output"] for entry in agent_outputs],
+        real_data=groundtruth,
     )
-    metrics = sim.evaluate()
+    metrics = {
+        "type": "simulation",
+        "metrics": metrics_obj.__dict__,
+        "data_info": {
+            "evaluated_count": len(groundtruth),
+            "original_simulation_count": len(agent_outputs),
+            "original_ground_truth_count": len(sim.groundtruth_data),
+        },
+    }
 
     (RESULTS_DIR / f"{run_name}_outputs.json").write_text(json.dumps(agent_outputs, indent=2), encoding="utf-8")
     (RESULTS_DIR / f"{run_name}_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
