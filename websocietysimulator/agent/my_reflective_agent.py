@@ -159,7 +159,15 @@ class ReflectiveUserAgent(BaselineUserAgent):
 
     _category_pref: Dict[str, float] = defaultdict(float)
     _user_bias: Dict[str, float] = defaultdict(float)
+    _category_count: Dict[str, int] = defaultdict(int)
+    _user_count: Dict[str, int] = defaultdict(int)
     _history: Deque[Dict[str, Any]] = deque(maxlen=500)
+    _priors_ready: bool = False
+    _global_mean: float = 3.5
+    _user_prior_sum: Dict[str, float] = defaultdict(float)
+    _user_prior_count: Dict[str, int] = defaultdict(int)
+    _cat_prior_sum: Dict[str, float] = defaultdict(float)
+    _cat_prior_count: Dict[str, int] = defaultdict(int)
     _lock = threading.Lock()
 
     def __init__(self, llm=None, reflection_interval: int = 10, history_size: int = 200, seed: int | None = 7):
@@ -167,6 +175,59 @@ class ReflectiveUserAgent(BaselineUserAgent):
         self.reflection_interval = reflection_interval
         self.local_history: Deque[Dict[str, Any]] = deque(maxlen=history_size)
         self.step_count = 0
+
+    # ---------------- priors ---------------- #
+    def _ensure_priors_loaded(self):
+        """Lazy-load user/category priors from the full review set."""
+        if self._priors_ready or not self.interaction_tool:
+            return
+        reviews = getattr(self.interaction_tool, "review_data", {}) or {}
+        items = getattr(self.interaction_tool, "item_data", {}) or {}
+        if not reviews:
+            self._priors_ready = True
+            return
+
+        total_sum = 0.0
+        total_count = 0
+        for review in reviews.values():
+            stars = review.get("stars")
+            if stars is None:
+                continue
+            stars_f = float(stars)
+            total_sum += stars_f
+            total_count += 1
+            uid = review.get("user_id")
+            if uid:
+                self._user_prior_sum[uid] += stars_f
+                self._user_prior_count[uid] += 1
+            item_id = review.get("item_id")
+            cat = None
+            if item_id and item_id in items:
+                cat_list = items[item_id].get("categories")
+                if isinstance(cat_list, list) and cat_list:
+                    cat = str(cat_list[0])
+            if cat:
+                self._cat_prior_sum[cat] += stars_f
+                self._cat_prior_count[cat] += 1
+
+        if total_count > 0:
+            self._global_mean = total_sum / total_count
+        self._priors_ready = True
+
+    def _shrink_mean(self, sum_val: float, count: int, alpha: float) -> float:
+        return (sum_val + self._global_mean * alpha) / (count + alpha)
+
+    def _user_prior(self, user_id: str) -> float:
+        self._ensure_priors_loaded()
+        count = self._user_prior_count.get(user_id, 0)
+        sum_val = self._user_prior_sum.get(user_id, 0.0)
+        return self._shrink_mean(sum_val, count, alpha=5.0)
+
+    def _category_prior(self, category: str) -> float:
+        self._ensure_priors_loaded()
+        count = self._cat_prior_count.get(category, 0)
+        sum_val = self._cat_prior_sum.get(category, 0.0)
+        return self._shrink_mean(sum_val, count, alpha=8.0)
 
     def _predict_stars(
         self,
@@ -179,15 +240,17 @@ class ReflectiveUserAgent(BaselineUserAgent):
     ) -> float:
         base_score = super()._predict_stars(user_id, item_id, user, item, user_reviews, item_reviews)
         category = self._get_category(item or {})
+        prior_user = self._user_prior(user_id) if user_id else self._global_mean
+        prior_cat = self._category_prior(category) if category else self._global_mean
+        blended = 0.6 * base_score + 0.25 * prior_user + 0.15 * prior_cat
 
         with self._lock:
             cat_bias = self._category_pref.get(category, 0.0)
             user_bias = self._user_bias.get(user_id, 0.0)
 
-        adjusted = base_score + 0.35 * cat_bias + 0.25 * user_bias
-        # Small noise keeps diversity
-        adjusted += 0.05 * self.random.uniform(-1, 1)
-        return _clamp(round(adjusted, 1))
+        adjusted = blended + 0.35 * cat_bias + 0.25 * user_bias
+        adjusted += 0.03 * self.random.uniform(-1, 1)
+        return _clamp(adjusted)
 
     def _reflect(self):
         """Update shared memories from accumulated observations."""
@@ -201,8 +264,17 @@ class ReflectiveUserAgent(BaselineUserAgent):
                 cat = entry["category"]
                 user_id = entry["user_id"]
 
-                self._category_pref[cat] = _clamp(self._category_pref.get(cat, 0.0) + 0.2 * delta, low=-2, high=2)
-                self._user_bias[user_id] = _clamp(self._user_bias.get(user_id, 0.0) + 0.1 * delta, low=-1, high=1)
+                self._category_count[cat] += 1
+                self._user_count[user_id] += 1
+                cat_scale = 1.0 / (self._category_count[cat] ** 0.5)
+                user_scale = 1.0 / (self._user_count[user_id] ** 0.5)
+
+                self._category_pref[cat] = _clamp(
+                    self._category_pref.get(cat, 0.0) + 0.15 * cat_scale * delta, low=-2, high=2
+                )
+                self._user_bias[user_id] = _clamp(
+                    self._user_bias.get(user_id, 0.0) + 0.08 * user_scale * delta, low=-1, high=1
+                )
                 self._history.append(entry)
             self.local_history.clear()
 
